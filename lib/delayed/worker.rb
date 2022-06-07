@@ -131,7 +131,7 @@ module Delayed
       @quiet = options.key?(:quiet) ? options[:quiet] : true
       @failed_reserve_count = 0
 
-      [:min_priority, :max_priority, :sleep_delay, :read_ahead, :queues, :exit_on_complete].each do |option|
+      [:min_priority, :max_priority, :sleep_delay, :read_ahead, :queues, :exit_on_complete, :graceful_exit].each do |option|
         self.class.send("#{option}=", options[option]) if options.key?(option)
       end
 
@@ -155,14 +155,24 @@ module Delayed
 
     def start # rubocop:disable CyclomaticComplexity, PerceivedComplexity
       trap('TERM') do
-        Thread.new { say 'Exiting...' }
-        stop
+        if @graceful_exit && !drain?
+          Thread.new { say 'Draining...' }
+          drain
+        else
+          Thread.new { say 'Exiting...' }
+          stop
+        end
         raise SignalException, 'TERM' if self.class.raise_signal_exceptions
       end
 
       trap('INT') do
-        Thread.new { say 'Exiting...' }
-        stop
+        if @graceful_exit
+          Thread.new { say 'Draining...' }
+          drain
+        else
+          Thread.new { say 'Exiting...' }
+          stop
+        end
         raise SignalException, 'INT' if self.class.raise_signal_exceptions && self.class.raise_signal_exceptions != :term
       end
 
@@ -179,7 +189,7 @@ module Delayed
           count = @result[0] + @result[1]
 
           if count.zero?
-            if self.class.exit_on_complete
+            if self.class.exit_on_complete || drain?
               say 'No more jobs available. Exiting'
               break
             elsif !stop?
@@ -193,6 +203,14 @@ module Delayed
           break if stop?
         end
       end
+    end
+
+    def drain
+      @drain = true
+    end
+
+    def drain?
+      !!@drain
     end
 
     def stop

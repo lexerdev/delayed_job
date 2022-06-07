@@ -77,6 +77,9 @@ module Delayed
         opt.on('--exit-on-complete', 'Exit when no more jobs are available to run. This will exit if all jobs are scheduled to run in the future.') do
           @options[:exit_on_complete] = true
         end
+        opt.on('--graceful-exit', 'Drain queue then exit when a TERM or INT signal is received.') do
+          @options[:graceful_exit] = true
+        end
         opt.on('--daemon-options a, b, c', Array, 'options to be passed through to daemons gem') do |daemon_options|
           @daemon_options = daemon_options
         end
