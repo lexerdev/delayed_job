@@ -180,4 +180,136 @@ describe Delayed::Worker do
       expect(performances).to eq(1)
     end
   end
+
+  describe 'signal handling' do
+    SIGNALS = %w[TERM INT]
+    SIGNAL_HANDLERS = {}
+
+    before(:each) do
+      old_signal_handlers = SIGNALS.each do |signal|
+        SIGNAL_HANDLERS[signal] = Signal.trap signal, 'SYSTEM_DEFAULT'
+      end
+    end
+
+    after(:each) do
+      SIGNAL_HANDLERS.each do |signal, signal_handler|
+        Signal.trap signal, signal_handler
+      end
+    end
+
+    class Semaphore
+      def initialize(count = 0)
+        @count = count
+        @mutex = Mutex.new
+        @condition = ConditionVariable.new
+      end
+
+      def acquire()
+        @mutex.synchronize do
+          until @count > 0
+            @condition.wait(@mutex)
+          end
+          @count -= 1
+        end
+      end
+
+      def release(count = 1)
+        @mutex.synchronize do
+          @count += count
+          @condition.broadcast()
+        end
+      end
+    end
+
+    SemaphoreJob = Struct.new(:semaphore) do
+      def perform
+        semaphore.acquire
+      end
+    end
+
+    context 'graceful_exit = false' do
+      worker_options = {}
+
+      it 'exits after the current job is complete' do
+        semaphore = Semaphore.new
+
+        # Enqueue 10 delayed jobs
+        expect do
+          10.times { Delayed::Job.enqueue SemaphoreJob.new(semaphore) }
+        end.to change { Delayed::Job.count }.by(10)
+        
+        # Start a new worker in a background thread
+        worker = Delayed::Worker.new(worker_options)
+        thread = Thread.new { worker.start }
+
+        # Complete 3 jobs on the queue
+        semaphore.release(3)
+
+        # Send a TERM signal to current process- current job should complete
+        # and then worker should exit
+        Process.kill 'TERM', 0
+
+        # Allow the current job to complete
+        semaphore.release()
+        
+        thread.join
+        expect(Delayed::Job.count).to eq(6)
+      end
+    end
+
+    context 'graceful_exit = true' do
+      worker_options = {graceful_exit: true}
+
+      it 'exits when the queue is drained' do
+        semaphore = Semaphore.new
+
+        # Enqueue 10 delayed jobs
+        expect do
+          10.times { Delayed::Job.enqueue SemaphoreJob.new(semaphore) }
+        end.to change { Delayed::Job.count }.by(10)
+        
+        # Start a new worker in a background thread
+        worker = Delayed::Worker.new(worker_options)
+        thread = Thread.new { worker.start }
+
+        # Complete 3 jobs on the queue
+        semaphore.release(3)
+
+        # Send a TERM signal to current process- all jobs should complete
+        Process.kill 'TERM', 0
+
+        # Allow the next 7 jobs to complete
+        semaphore.release(7)
+        
+        thread.join
+        expect(Delayed::Job.count).to eq(0)
+      end
+
+      it 'exits after the current job if multiple signals are received' do
+        semaphore = Semaphore.new
+
+        # Enqueue 10 delayed jobs
+        expect do
+          10.times { Delayed::Job.enqueue SemaphoreJob.new(semaphore) }
+        end.to change { Delayed::Job.count }.by(10)
+        
+        # Start a new worker in a background thread
+        worker = Delayed::Worker.new(worker_options)
+        thread = Thread.new { worker.start }
+
+        # Complete 3 jobs on the queue
+        semaphore.release(3)
+
+        # Send *two* TERM signals to current process- current job should
+        # complete, then worker should exit
+        2.times { Process.kill 'TERM', 0 }
+
+        # Allow the next job to complete
+        semaphore.release()
+        
+        thread.join
+        expect(Delayed::Job.count).to eq(6)
+      end
+    end
+  end
 end
