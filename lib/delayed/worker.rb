@@ -22,7 +22,7 @@ module Delayed
     cattr_accessor :min_priority, :max_priority, :max_attempts, :max_run_time,
                    :default_priority, :sleep_delay, :logger, :delay_jobs, :queues,
                    :read_ahead, :plugins, :destroy_failed_jobs, :exit_on_complete,
-                   :default_log_level
+                   :default_log_level, :graceful_exit
 
     # Named queue into which jobs are enqueued by default
     cattr_accessor :default_queue_name
@@ -131,7 +131,7 @@ module Delayed
       @quiet = options.key?(:quiet) ? options[:quiet] : true
       @failed_reserve_count = 0
 
-      [:min_priority, :max_priority, :sleep_delay, :read_ahead, :queues, :exit_on_complete].each do |option|
+      [:min_priority, :max_priority, :sleep_delay, :read_ahead, :queues, :exit_on_complete, :graceful_exit].each do |option|
         self.class.send("#{option}=", options[option]) if options.key?(option)
       end
 
@@ -153,17 +153,24 @@ module Delayed
     # Setting the name to nil will reset the default worker name
     attr_writer :name
 
-    def start # rubocop:disable CyclomaticComplexity, PerceivedComplexity
-      trap('TERM') do
+    def on_signal(signal)
+      if self.class.graceful_exit && !drain?
+        Thread.new { say 'Draining...' }
+        drain
+      else
         Thread.new { say 'Exiting...' }
         stop
-        raise SignalException, 'TERM' if self.class.raise_signal_exceptions
       end
+      raise SignalException, signal if should_raise_signal?(signal)
+    end
 
-      trap('INT') do
-        Thread.new { say 'Exiting...' }
-        stop
-        raise SignalException, 'INT' if self.class.raise_signal_exceptions && self.class.raise_signal_exceptions != :term
+    def should_raise_signal?(signal)
+      self.class.raise_signal_exceptions && (signal == 'TERM' || self.class.raise_signal_exceptions != :term)
+    end
+
+    def start # rubocop:disable CyclomaticComplexity, PerceivedComplexity
+      ['TERM', 'INT'].each do |signal|
+        trap(signal) { on_signal(signal) }
       end
 
       say 'Starting job worker'
@@ -179,7 +186,7 @@ module Delayed
           count = @result[0] + @result[1]
 
           if count.zero?
-            if self.class.exit_on_complete
+            if self.class.exit_on_complete || drain?
               say 'No more jobs available. Exiting'
               break
             elsif !stop?
@@ -193,6 +200,14 @@ module Delayed
           break if stop?
         end
       end
+    end
+
+    def drain
+      @drain = true
+    end
+
+    def drain?
+      !!@drain
     end
 
     def stop

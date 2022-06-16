@@ -180,4 +180,134 @@ describe Delayed::Worker do
       expect(performances).to eq(1)
     end
   end
+
+  describe 'signal handling' do
+    around(:each) do |example|
+      signals = %w[TERM INT]
+      signal_handlers = {}
+      
+      old_signal_handlers = signals.each do |signal|
+        signal_handlers[signal] = Signal.trap signal, 'SYSTEM_DEFAULT'
+      end
+      
+      example.run
+      
+      signal_handlers.each do |signal, signal_handler|
+        Signal.trap signal, signal_handler
+      end
+    rescue SignalException => e
+      puts("Caught SignalException: #{e}")
+      raise unless signals.include?(Signal.signame(e.signo))
+    end
+
+    let(:start_semaphore) { Semaphore.new }
+
+    let(:end_semaphore) { Semaphore.new }
+
+    def signal_self(signal = 'TERM')
+      puts "sending #{signal} to myself"
+      Process.kill(signal, 0)
+    end
+
+    def enqueue_jobs(start_semaphore, end_semaphore, count)
+      puts("Enqueuing #{count} jobs")
+      count.times { |i| Delayed::Job.enqueue(SemaphoreJob.new(start_semaphore, end_semaphore, i)) }
+    end
+
+    def run_jobs(start_semaphore, end_semaphore, count)
+      puts("Running #{count} jobs")
+      start_semaphore.release(count)
+      count.times do |i|
+        puts("#{count - i} jobs left")
+        end_semaphore.acquire()
+      end
+    end
+
+    context 'graceful_exit = false' do
+      let(:worker_options) { {} }
+
+      it 'exits after the current job is complete' do
+        # Enqueue 10 delayed jobs
+        enqueue_jobs(start_semaphore, end_semaphore, 10)
+        
+        # Start a new worker in a background thread
+        worker = Delayed::Worker.new(worker_options)
+        thread = Thread.new { worker.start }
+
+        # Complete 3 jobs on the queue
+        run_jobs(start_semaphore, end_semaphore, 3)
+
+        # Send a TERM signal to current process- current job should complete
+        # and then worker should exit
+        signal_self
+
+        # Allow the current job to complete
+        start_semaphore.release()
+        
+        thread.join
+
+        # The Worker might not have taken the next job from queue yet, so
+        # there could be either 7 items (if not taken) or 6 (if already taken).
+        expect(Delayed::Job.count).to eq(6).or eq(7)
+
+      rescue SignalException => e
+        puts("Caught SignalException #{e}")
+        raise unless e.signo == Signal.list['TERM']
+      end
+    end
+
+    context 'graceful_exit = true' do
+      let(:worker_options) { {graceful_exit: true} }
+
+      it 'exits when the queue is drained' do
+        # Enqueue 10 delayed jobs
+        enqueue_jobs(start_semaphore, end_semaphore, 10)
+        
+        # Start a new worker in a background thread
+        worker = Delayed::Worker.new(worker_options)
+        thread = Thread.new { worker.start }
+
+        # Complete 3 jobs on the queue
+        run_jobs(start_semaphore, end_semaphore, 3)
+
+        # Send a TERM signal to current process- all jobs should complete
+        signal_self
+
+        # Allow the next 7 jobs to complete
+        run_jobs(start_semaphore, end_semaphore, 7)
+        
+        thread.join
+        expect(Delayed::Job.count).to eq(0)
+
+      rescue SignalException => e
+        puts("Caught SignalException #{e}")
+        raise unless e.signo == Signal.list['TERM']
+      end
+
+      it 'exits after the current job if multiple signals are received' do
+        # Enqueue 10 delayed jobs
+        enqueue_jobs(start_semaphore, end_semaphore, 10)
+        
+        # Start a new worker in a background thread
+        worker = Delayed::Worker.new(worker_options)
+        thread = Thread.new { worker.start }
+
+        # Complete 3 jobs on the queue
+        run_jobs(start_semaphore, end_semaphore, 3)
+
+        # Send *two* TERM signals to current process- current job should
+        # complete, then worker should exit
+        2.times { signal_self }
+
+        # Allow the next job to complete
+        start_semaphore.release()
+        
+        thread.join
+        expect(Delayed::Job.count).to eq(6).or eq(7)
+      rescue SignalException => e
+        puts("Caught SignalException #{e}")
+        raise unless e.signo == Signal.list['TERM']
+      end
+    end
+  end
 end
