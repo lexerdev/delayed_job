@@ -22,7 +22,7 @@ module Delayed
     cattr_accessor :min_priority, :max_priority, :max_attempts, :max_run_time,
                    :default_priority, :sleep_delay, :logger, :delay_jobs, :queues,
                    :read_ahead, :plugins, :destroy_failed_jobs, :exit_on_complete,
-                   :default_log_level
+                   :default_log_level, :graceful_exit
 
     # Named queue into which jobs are enqueued by default
     cattr_accessor :default_queue_name
@@ -153,27 +153,24 @@ module Delayed
     # Setting the name to nil will reset the default worker name
     attr_writer :name
 
-    def start # rubocop:disable CyclomaticComplexity, PerceivedComplexity
-      trap('TERM') do
-        if @graceful_exit && !drain?
-          Thread.new { say 'Draining...' }
-          drain
-        else
-          Thread.new { say 'Exiting...' }
-          stop
-        end
-        raise SignalException, 'TERM' if self.class.raise_signal_exceptions
+    def on_signal(signal)
+      if self.class.graceful_exit && !drain?
+        Thread.new { say 'Draining...' }
+        drain
+      else
+        Thread.new { say 'Exiting...' }
+        stop
       end
+      raise SignalException, signal if should_raise_signal?(signal)
+    end
 
-      trap('INT') do
-        if @graceful_exit
-          Thread.new { say 'Draining...' }
-          drain
-        else
-          Thread.new { say 'Exiting...' }
-          stop
-        end
-        raise SignalException, 'INT' if self.class.raise_signal_exceptions && self.class.raise_signal_exceptions != :term
+    def should_raise_signal?(signal)
+      self.class.raise_signal_exceptions && (signal == 'TERM' || self.class.raise_signal_exceptions != :term)
+    end
+
+    def start # rubocop:disable CyclomaticComplexity, PerceivedComplexity
+      ['TERM', 'INT'].each do |signal|
+        trap(signal) { on_signal(signal) }
       end
 
       say 'Starting job worker'
